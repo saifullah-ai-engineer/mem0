@@ -330,6 +330,83 @@ def test_list_uninitialized_index_returns_nested_list(faiss_instance):
     assert results[0] == []
 
 
+def test_list_bool_and_int_filters_are_distinct(faiss_instance):
+    # Regression for mem0ai/mem0#8014: bool and int must not conflate.
+    # Python's False == 0 and True == 1, but Qdrant payload typing keeps
+    # them distinct, so a filter for False must not match a stored 0.
+    faiss_instance.docstore = {
+        "id0": {"stage": 0},
+        "idF": {"stage": False},
+        "id1": {"stage": 1},
+        "idT": {"stage": True},
+    }
+
+    assert [r.id for r in faiss_instance.list(filters={"stage": False})[0]] == ["idF"]
+    assert [r.id for r in faiss_instance.list(filters={"stage": 0})[0]] == ["id0"]
+    assert [r.id for r in faiss_instance.list(filters={"stage": True})[0]] == ["idT"]
+    assert [r.id for r in faiss_instance.list(filters={"stage": 1})[0]] == ["id1"]
+
+
+def test_list_operator_filters(faiss_instance):
+    # Regression for mem0ai/mem0#8014: structured operator dicts must be
+    # evaluated, not compared against the stored value (which silently
+    # returned zero results).
+    faiss_instance.docstore = {
+        "id0": {"stage": 0},
+        "idF": {"stage": False},
+        "id1": {"stage": 1},
+        "idT": {"stage": True},
+    }
+
+    assert [r.id for r in faiss_instance.list(filters={"stage": {"eq": False}})[0]] == ["idF"]
+    assert sorted(r.id for r in faiss_instance.list(filters={"stage": {"ne": False}})[0]) == [
+        "id0",
+        "id1",
+        "idT",
+    ]
+    assert sorted(r.id for r in faiss_instance.list(filters={"stage": {"in": [0, 1]}})[0]) == [
+        "id0",
+        "id1",
+    ]
+    assert sorted(r.id for r in faiss_instance.list(filters={"stage": {"nin": [0, 1]}})[0]) == [
+        "idF",
+        "idT",
+    ]
+
+
+def test_list_range_filter_skips_incompatible_types(faiss_instance):
+    # Regression for mem0ai/mem0#8014: a range filter over a namespace with
+    # mixed types must skip non-matching items instead of raising.
+    faiss_instance.docstore = {
+        "id_str": {"v": "hello"},
+        "id_dict": {"v": {"a": 1}},
+        "id_num": {"v": 5},
+    }
+
+    assert [r.id for r in faiss_instance.list(filters={"v": {"gt": 0}})[0]] == ["id_num"]
+    assert [r.id for r in faiss_instance.list(filters={"v": {"lt": 99}})[0]] == ["id_num"]
+
+
+def test_list_contains_filters(faiss_instance):
+    faiss_instance.docstore = {
+        "id1": {"note": "Hello World"},
+        "id2": {"note": "goodbye"},
+    }
+
+    assert [r.id for r in faiss_instance.list(filters={"note": {"contains": "World"}})[0]] == ["id1"]
+    assert [r.id for r in faiss_instance.list(filters={"note": {"icontains": "world"}})[0]] == ["id1"]
+    assert faiss_instance.list(filters={"note": {"contains": "missing"}})[0] == []
+
+
+def test_list_unknown_operator_raises(faiss_instance):
+    # Unknown operators must fail loudly like Qdrant does, not silently
+    # return zero results.
+    faiss_instance.docstore = {"id1": {"stage": 1}}
+
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        faiss_instance.list(filters={"stage": {"nope": 1}})
+
+
 def test_col_info(faiss_instance, mock_faiss_index):
     # Mock index attributes
     mock_faiss_index.ntotal = 5
