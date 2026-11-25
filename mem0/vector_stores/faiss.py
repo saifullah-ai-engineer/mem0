@@ -131,6 +131,81 @@ def _validate_docstore_structure(data: Any) -> tuple:
     return docstore, index_to_id
 
 
+# Operator names shared with the Qdrant and OracleDB filter builders.
+_FILTER_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "in", "nin", "contains", "icontains"}
+
+
+def _values_equal(stored: Any, expected: Any) -> bool:
+    """Strict equality for filter matching.
+
+    Qdrant payload typing keeps bool and int distinct, so a filter for
+    False must not match a stored 0 (plain ``==`` would match, since
+    ``False == 0`` in Python). Numeric int/float equality is unchanged.
+    """
+    if isinstance(stored, bool) or isinstance(expected, bool):
+        return isinstance(stored, bool) and isinstance(expected, bool) and stored == expected
+    return stored == expected
+
+
+def _matches_range(stored: Any, operator: str, expected: Any) -> bool:
+    """Range comparison that treats incompatible types as non-matching.
+
+    A stored string, dict, bool, or None under a range filter must not
+    crash the whole list/search call; it simply does not match.
+    """
+    if isinstance(stored, bool) or isinstance(expected, bool):
+        return False
+    try:
+        if operator == "gt":
+            return stored > expected
+        if operator == "gte":
+            return stored >= expected
+        if operator == "lt":
+            return stored < expected
+        if operator == "lte":
+            return stored <= expected
+    except TypeError:
+        return False
+    return False
+
+
+def _matches_operators(stored: Any, operators: Dict, key: str) -> bool:
+    """Evaluate a mem0 operator dict (``{"eq": ...}``, ``{"gt": ...}``, ...) against one stored value."""
+    unknown = set(operators) - _FILTER_OPERATORS
+    if unknown:
+        raise ValueError(
+            f"Unsupported filter operator(s) for field '{key}': {unknown}. "
+            f"Supported operators: {sorted(_FILTER_OPERATORS)}"
+        )
+    for operator, expected in operators.items():
+        if operator == "eq":
+            if not _values_equal(stored, expected):
+                return False
+        elif operator == "ne":
+            if _values_equal(stored, expected):
+                return False
+        elif operator in ("gt", "gte", "lt", "lte"):
+            if not _matches_range(stored, operator, expected):
+                return False
+        elif operator == "in":
+            if not isinstance(expected, list):
+                raise ValueError(f"Operator 'in' for field '{key}' expects a list, got {type(expected).__name__}")
+            if not any(_values_equal(stored, item) for item in expected):
+                return False
+        elif operator == "nin":
+            if not isinstance(expected, list):
+                raise ValueError(f"Operator 'nin' for field '{key}' expects a list, got {type(expected).__name__}")
+            if any(_values_equal(stored, item) for item in expected):
+                return False
+        elif operator == "contains":
+            if not (isinstance(stored, str) and isinstance(expected, str) and expected in stored):
+                return False
+        elif operator == "icontains":
+            if not (isinstance(stored, str) and isinstance(expected, str) and expected.lower() in stored.lower()):
+                return False
+    return True
+
+
 class OutputData(BaseModel):
     id: Optional[str]  # memory id
     score: Optional[float]  # distance
@@ -434,6 +509,14 @@ class FAISS(VectorStoreBase):
         """
         Apply filters to a payload.
 
+        Supports the same filter syntax as the other vector stores: plain
+        equality (``{"field": value}``), a list shorthand for ``in``
+        (``{"field": ["a", "b"]}``), and operator dicts
+        (``{"field": {"eq": value}}``, ``gt``/``gte``/``lt``/``lte``,
+        ``in``/``nin``, ``contains``/``icontains``). Bool and int are
+        kept distinct, matching Qdrant payload typing, and range
+        comparisons against incompatible types simply do not match.
+
         Args:
             payload (Dict): Payload to filter.
             filters (Dict): Filters to apply.
@@ -448,10 +531,13 @@ class FAISS(VectorStoreBase):
             if key not in payload:
                 return False
 
-            if isinstance(value, list):
-                if payload[key] not in value:
+            if isinstance(value, dict):
+                if not _matches_operators(payload[key], value, key):
                     return False
-            elif payload[key] != value:
+            elif isinstance(value, list):
+                if not any(_values_equal(payload[key], item) for item in value):
+                    return False
+            elif not _values_equal(payload[key], value):
                 return False
 
         return True
