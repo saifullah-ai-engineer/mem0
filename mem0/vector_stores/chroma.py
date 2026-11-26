@@ -326,49 +326,75 @@ class ChromaDB(VectorStoreBase):
                 return clauses[0]
             return {operator: clauses}
 
-        processed_filters = []
+        # Logical operators in mem0's enhanced filter syntax. Qdrant accepts
+        # both the uppercase form (AND/OR/NOT) and the dollar form
+        # ($and/$or/$not); ChromaDB only understands the dollar form, so
+        # normalize here. A bare "AND"/"OR"/"NOT" key is therefore a logical
+        # operator, never a metadata field name, matching Qdrant.
+        logical_map = {
+            "AND": "$and",
+            "$and": "$and",
+            "OR": "$or",
+            "$or": "$or",
+            "NOT": "$not",
+            "$not": "$not",
+        }
 
-        for key, value in where.items():
-            if key == "$or":
-                or_conditions = []
-                for condition in value:
+        def negate_clause(clause):
+            """Negate one ChromaDB where clause (De Morgan for $and/$or)."""
+            if "$and" in clause:
+                return {"$or": [negate_clause(sub) for sub in clause["$and"]]}
+            if "$or" in clause:
+                return {"$and": [negate_clause(sub) for sub in clause["$or"]]}
+            # Single field expression {field: {op: value}}. The operators
+            # here are already ChromaDB dollar form ($gt, $in), while
+            # negate_map is keyed by the bare mem0 operators (gt, in),
+            # so strip the "$" before the lookup. Its values already
+            # carry the "$", so nothing is added back.
+            for field, expression in clause.items():
+                if isinstance(expression, dict):
+                    negated = {}
+                    for op, val in expression.items():
+                        base = op[1:] if isinstance(op, str) and op.startswith("$") else op
+                        negated[negate_map.get(base, "$ne")] = val
+                    return {field: negated}
+            return clause
+
+        def process(filter_dict):
+            """Convert one filter dict to a ChromaDB where clause."""
+            processed_filters = []
+            for key, value in filter_dict.items():
+                operator = logical_map.get(key)
+                if operator in ("$and", "$or"):
+                    # Each element is a sub-filter dict; recurse so nested
+                    # logical operators (e.g. OR inside AND) are normalized
+                    # too instead of becoming literal field names.
+                    conditions = value if isinstance(value, list) else [value]
                     sub_clauses = []
-                    for sub_key, sub_value in condition.items():
-                        sub_clauses.extend(convert_condition(sub_key, sub_value))
-                    combined = combine(sub_clauses, "$and")
+                    for condition in conditions:
+                        clause = process(condition)
+                        if clause:
+                            sub_clauses.append(clause)
+                    combined = combine(sub_clauses, operator)
                     if combined:
-                        or_conditions.append(combined)
-                combined_or = combine(or_conditions, "$or")
-                if combined_or:
-                    processed_filters.append(combined_or)
-
-            elif key == "$not":
-                negated_per_group = []
-                for condition in value:
-                    negated_fields = []
-                    for sub_key, sub_value in condition.items():
-                        if isinstance(sub_value, dict):
-                            for op, val in sub_value.items():
-                                # Unknown operators mirror the positive-path
-                                # equality fallback as inequality (previously
-                                # they were silently dropped, which could
-                                # erase the entire NOT clause).
-                                negated_fields.append({sub_key: {negate_map.get(op, "$ne"): val}})
-                        else:
-                            negated_fields.append({sub_key: {"$ne": sub_value}})
-                    # NOT(a AND b) == (NOT a) OR (NOT b)
-                    combined = combine(negated_fields, "$or")
+                        processed_filters.append(combined)
+                elif operator == "$not":
+                    # NOT(a AND b) == (NOT a) OR (NOT b), and NOT of several
+                    # conditions is the AND of their negations.
+                    conditions = value if isinstance(value, list) else [value]
+                    negated = []
+                    for condition in conditions:
+                        clause = process(condition)
+                        if clause:
+                            negated.append(negate_clause(clause))
+                    combined = combine(negated, "$and")
                     if combined:
-                        negated_per_group.append(combined)
-                combined_not = combine(negated_per_group, "$and")
-                if combined_not:
-                    processed_filters.append(combined_not)
+                        processed_filters.append(combined)
+                else:
+                    # Regular condition
+                    combined = combine(convert_condition(key, value), "$and")
+                    if combined:
+                        processed_filters.append(combined)
+            return combine(processed_filters, "$and")
 
-            else:
-                # Regular condition
-                combined = combine(convert_condition(key, value), "$and")
-                if combined:
-                    processed_filters.append(combined)
-
-        # Return appropriate format based on number of conditions
-        return combine(processed_filters, "$and")
+        return process(where)
