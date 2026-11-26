@@ -419,3 +419,54 @@ def test_generate_where_clause_not_contains_negates_instead_of_vanishing():
 
     result = ChromaDB._generate_where_clause({"$not": [{"title": {"icontains": "draft"}}]})
     assert result == {"title": {"$ne": "draft"}}
+
+
+def test_generate_where_clause_uppercase_and_or_not():
+    """Uppercase AND/OR/NOT must normalize to ChromaDB $and/$or/$not.
+
+    Regression test for #8024: the uppercase operators were treated as
+    literal metadata field names, producing {"AND": {"$eq": [...]}} and
+    crashing ChromaDB with InvalidArgumentError. Qdrant accepts both
+    forms, so ChromaDB must too.
+    """
+    result = ChromaDB._generate_where_clause({"AND": [{"user": "alice"}, {"OR": [{"tag": "x"}, {"tag": "y"}]}]})
+    assert result == {
+        "$and": [
+            {"user": {"$eq": "alice"}},
+            {"$or": [{"tag": {"$eq": "x"}}, {"tag": {"$eq": "y"}}]},
+        ]
+    }
+
+    result = ChromaDB._generate_where_clause({"OR": [{"user": "alice"}, {"user": "bob"}]})
+    assert result == {"$or": [{"user": {"$eq": "alice"}}, {"user": {"$eq": "bob"}}]}
+
+    result = ChromaDB._generate_where_clause({"NOT": [{"user": "bob"}]})
+    assert result == {"user": {"$ne": "bob"}}
+
+
+def test_generate_where_clause_dollar_and():
+    """$and was never handled: it fell through to the regular-condition path
+    and produced {"$and": {"$eq": [...]}, which ChromaDB rejects.
+
+    Regression test for #8024.
+    """
+    result = ChromaDB._generate_where_clause({"$and": [{"user": "alice"}, {"tag": "x"}]})
+    assert result == {"$and": [{"user": {"$eq": "alice"}}, {"tag": {"$eq": "x"}}]}
+
+
+def test_generate_where_clause_uppercase_not_with_nested_or():
+    """NOT of a nested OR must apply De Morgan instead of treating OR as a
+    field name: NOT(a OR b) == (NOT a) AND (NOT b)."""
+    result = ChromaDB._generate_where_clause({"NOT": [{"OR": [{"tag": "x"}, {"tag": "y"}]}]})
+    assert result == {"$and": [{"tag": {"$ne": "x"}}, {"tag": {"$ne": "y"}}]}
+
+
+def test_generate_where_clause_uppercase_and_with_operators():
+    """Uppercase AND branches keep comparison operators, like $or does."""
+    result = ChromaDB._generate_where_clause({"AND": [{"age": {"gte": 18, "lte": 65}}, {"vip": True}]})
+    assert result == {
+        "$and": [
+            {"$and": [{"age": {"$gte": 18}}, {"age": {"$lte": 65}}]},
+            {"vip": {"$eq": True}},
+        ]
+    }
